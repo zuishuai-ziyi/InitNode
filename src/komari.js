@@ -55,21 +55,31 @@ export async function registerClient(endpoint, autoDiscoveryKey, name) {
   return data.data; // { uuid, token }
 }
 
-// 修正节点名(去掉 Auto- 前缀或改名)。部分更新,只动 name 字段。
-export async function renameClient(endpoint, adminApiKey, uuid, name) {
-  await request(`${endpoint}/api/admin/client/${uuid}/edit`, {
+// 修正节点名/写入标签(部分更新;tags 为分号分隔的字符串,传空串清除)。
+export function updateClient(endpoint, adminApiKey, uuid, fields) {
+  return request(`${endpoint}/api/admin/client/${uuid}/edit`, {
     method: 'POST',
     headers: admin(endpoint, adminApiKey),
-    body: JSON.stringify({ name }),
+    body: JSON.stringify(fields),
   });
+}
+
+// 兼容旧调用:仅改名
+export function renameClient(endpoint, adminApiKey, uuid, name) {
+  return updateClient(endpoint, adminApiKey, uuid, { name });
+}
+
+// 已注册节点列表(admin)
+export async function fetchClients(endpoint, adminApiKey) {
+  const data = await request(`${endpoint}/api/admin/client/list`, { headers: admin(endpoint, adminApiKey) });
+  return Array.isArray(data) ? data : [];
 }
 
 // 等待 agent 上线:轮询 admin client 列表,updated_at 晚于 since 视为已上报。
 export async function waitForOnline(endpoint, adminApiKey, uuid, since, { timeoutMs = 180_000, intervalMs = 5_000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const data = await request(`${endpoint}/api/admin/client/list`, { headers: admin(endpoint, adminApiKey) });
-    const list = Array.isArray(data) ? data : [];
+    const list = await fetchClients(endpoint, adminApiKey);
     const me = list.find((c) => c.uuid === uuid);
     if (me) {
       const updated = Date.parse(me.updated_at || '');

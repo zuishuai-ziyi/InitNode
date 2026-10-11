@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // initnode —— 新云服务器初始化 CLI
-// 流程:Komari 配置 → 询问节点信息 → 生成并上传 SSH 密钥 → 写入 ssh config/known_hosts
-//       → 新密钥验证 → Komari 自动发现注册 + agent 安装 → NodeQuality 质量检测
+// 流程:Komari 配置 → 连接信息问询 → 连接(TOFU,可选探测公网 IP)→ 节点名称/标签/SSH 密钥
+//       → 公钥部署 + ssh config/known_hosts → 新密钥验证 → Komari 注册(名称+标签)+ agent
+//       → NodeQuality 质量检测
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -18,9 +19,13 @@ import {
   existingTokens, deriveAlias, findConflictingHost, appendEntry, addToKnownHosts,
 } from './src/sshconfig.js';
 import {
-  fetchAutoDiscoveryKey, registerClient, renameClient, waitForOnline,
+  fetchAutoDiscoveryKey, fetchClients, registerClient, updateClient, waitForOnline,
 } from './src/komari.js';
 import { runNodeQuality } from './src/nodequality.js';
+import {
+  detectPublicIP, normalizeHost, isPrivateOrLocalIP,
+} from './src/publicip.js';
+import { deriveTagTemplates, parseTagInput } from './src/tags.js';
 
 const c = {
   dim: (s) => `\x1b[2m${s}\x1b[0m`,
@@ -64,20 +69,22 @@ async function main() {
   const kcfg = await ensureKomariConfig(config);
   saveConfig(config);
   let adKey;
+  let tagTemplates = [];
   try {
     const { autoDiscoveryKey } = await fetchAutoDiscoveryKey(kcfg.endpoint, kcfg.adminApiKey);
     if (!autoDiscoveryKey) throw new Error('未启用自动发现:面板设置里 auto_discovery 为空');
     adKey = autoDiscoveryKey;
     ok(`Komari 连接成功,自动发现密钥已获取(${adKey.slice(0, 6)}***)`);
+    try {
+      tagTemplates = deriveTagTemplates(await fetchClients(kcfg.endpoint, kcfg.adminApiKey));
+    } catch { /* 模板仅是便利功能,失败不阻塞 */ }
   } catch (err) {
     return die(`Komari 配置无效: ${err.message}`);
   }
   const { endpoint, adminApiKey } = kcfg;
 
-  // ---------- [2/7] 节点信息 ----------
-  step(2, TOTAL, '节点信息');
-  const name = (await prompts.ask('节点名称(用于密钥注释与 Komari 节点名,如:雨云 - 湖北十堰 - 192)')).trim();
-  if (!name) return die('节点名称不能为空');
+  // ---------- [2/7] 连接信息 ----------
+  step(2, TOTAL, '服务器连接信息');
   const host = (await prompts.ask('服务器地址(IPv4 / IPv6 / 域名)')).trim();
   if (!host) return die('服务器地址不能为空');
   const port = await prompts.askInt('SSH 端口', 22);
@@ -99,38 +106,10 @@ async function main() {
     firstPassphrase = await prompts.askPassword('私钥口令(无则回车)');
     auth = { privateKeyPath: keyPath };
   }
+  const autoIP = await prompts.confirm('连接后自动探测服务器公网 IP?(用于密钥命名/别名,可选替换连接地址)', true);
 
-  // 短别名(惯例:IPv4 首段 / IPv6 首组)
-  let alias = deriveAlias(host);
-  const tokens = existingTokens();
-  if (tokens.has(alias.toLowerCase()) || tokens.has(host.toLowerCase())) {
-    const conflicting = findConflictingHost(alias);
-    if (!conflicting || conflicting !== host) {
-      warn(`短别名 "${alias}" 已被占用${conflicting ? `(HostName: ${conflicting})` : ''}`);
-      alias = (await prompts.ask('请为该节点另指定一个短别名')).trim();
-      if (!alias) return die('别名不能为空');
-      if (tokens.has(alias.toLowerCase())) return die(`别名 "${alias}" 也已存在,请手动处理 ~/.ssh/config 后重试`);
-    }
-  }
-
-  // ---------- [3/7] SSH 密钥 ----------
-  step(3, TOTAL, 'SSH 密钥');
-  const { privateKeyPath, publicKeyPath } = keyPathsFor(host);
-  if (keyExists({ privateKeyPath, publicKeyPath })) {
-    prompts.print(`  已存在密钥: ${privateKeyPath}`);
-    if (!(await prompts.confirm('复用该密钥?', true))) {
-      await generateKeyPair(privateKeyPath, name);
-      ok(`已重新生成密钥对: ${privateKeyPath}`);
-    }
-  } else {
-    await generateKeyPair(privateKeyPath, name);
-    trail.keyCreated = host;
-    ok(`已生成密钥对: ${privateKeyPath}`);
-  }
-  const pubKey = readPublicKey(publicKeyPath).trim();
-
-  // ---------- [4/7] 首连 + 上传公钥 ----------
-  step(4, TOTAL, `连接 ${host}:${port} 并上传公钥`);
+  // ---------- [3/7] 连接服务器 ----------
+  step(3, TOTAL, `连接 ${host}:${port}`);
   let conn;
   let fingerprint;
   for (;;) {
@@ -148,6 +127,66 @@ async function main() {
     return die('已中止');
   }
 
+  // 公网 IP 探测与用途选择
+  let detected = null;
+  let ipUsage = 'none'; // 'name' = 仅密钥命名/别名; 'all' = 连接地址也替换; 'none' = 忽略
+  if (autoIP) {
+    prompts.print('  探测服务器公网 IP...');
+    detected = await detectPublicIP(conn);
+    if (!detected) {
+      warn('公网 IP 探测失败(服务器无 curl/wget 或网络受限),继续使用原地址');
+    } else if (normalizeHost(host) === detected) {
+      ok(`公网 IP 与连接地址一致: ${detected}`);
+    } else {
+      prompts.print(`  ${c.bold('检测到公网 IP: ' + detected)}  ${c.dim(`(当前连接地址: ${host})`)}`);
+      const opts = [
+        { label: `密钥命名/别名用公网 IP,连接地址保持 ${host}`, value: 'name' },
+        { label: `密钥命名与连接地址都改为公网 IP`, value: 'all' },
+        { label: `忽略探测结果,全部沿用 ${host}`, value: 'none' },
+      ];
+      if (!isPrivateOrLocalIP(host)) opts.push(opts.shift()); // 公网地址直连时推荐连地址也替换
+      ipUsage = await prompts.choose('公网 IP 的用途', opts);
+      if (ipUsage === 'none') detected = null;
+    }
+  }
+  // connHost: ssh config / known_hosts / 后续重连使用的地址;keyHost: 密钥文件命名
+  const connHost = ipUsage === 'all' && detected ? detected : host;
+  const keyHost = detected || host;
+
+  // ---------- [4/7] 节点名称 / 标签 / SSH 密钥 ----------
+  step(4, TOTAL, '节点名称与 SSH 密钥');
+  const nameHint = `节点名称(用于密钥注释与 Komari 节点名,惯例:厂商 - 地区 - IP尾段,如:雨云 - 香港 - 189)`;
+  const name = (await prompts.ask(nameHint)).trim();
+  if (!name) return die('节点名称不能为空');
+
+  const tags = await askTags(tagTemplates);
+
+  const { privateKeyPath, publicKeyPath } = keyPathsFor(keyHost);
+  if (keyExists({ privateKeyPath, publicKeyPath })) {
+    prompts.print(`  已存在密钥: ${privateKeyPath}`);
+    if (!(await prompts.confirm('复用该密钥?', true))) {
+      await generateKeyPair(privateKeyPath, name);
+      ok(`已重新生成密钥对: ${privateKeyPath}`);
+    }
+  } else {
+    await generateKeyPair(privateKeyPath, name);
+    trail.keyCreated = keyHost;
+    ok(`已生成密钥对: ${privateKeyPath}`);
+  }
+  const pubKey = readPublicKey(publicKeyPath).trim();
+
+  // ---------- [5/7] 公钥部署 + ssh config ----------
+  step(5, TOTAL, '部署公钥并写入 ssh config');
+  try {
+    await execSSH(conn, 'true', { timeoutMs: 10_000 });
+  } catch {
+    warn('原连接已断开,重新连接...');
+    try {
+      ({ conn } = await connectSSH({ host, port, username: user, auth, passphrase: firstPassphrase }));
+    } catch (err) {
+      return die(`重连失败: ${normalizeSshError(err)}`);
+    }
+  }
   try {
     await installPubKey(conn, pubKey);
     ok(`公钥已写入 ${user}@ 的 authorized_keys`);
@@ -156,13 +195,24 @@ async function main() {
     return die(`公钥上传失败: ${normalizeSshError(err)}`);
   }
 
-  // ---------- [5/7] ssh config + known_hosts ----------
-  step(5, TOTAL, '写入 ssh config / known_hosts');
-  appendEntry({ alias, host, port, user, identityFile: privateKeyPath, comment: name });
-  trail.configBlock = { alias, host };
+  // 短别名(惯例:IPv4 首段 / IPv6 首组),冲突时另指定
+  let alias = deriveAlias(connHost);
+  const tokens = existingTokens();
+  if (tokens.has(alias.toLowerCase()) || tokens.has(connHost.toLowerCase())) {
+    const conflicting = findConflictingHost(alias);
+    if (!conflicting || conflicting !== connHost) {
+      warn(`短别名 "${alias}" 已被占用${conflicting ? `(HostName: ${conflicting})` : ''}`);
+      alias = (await prompts.ask('请为该节点另指定一个短别名')).trim();
+      if (!alias) return die('别名不能为空');
+      if (tokens.has(alias.toLowerCase())) return die(`别名 "${alias}" 也已存在,请手动处理 ~/.ssh/config 后重试`);
+    }
+  }
+
+  appendEntry({ alias, host: connHost, port, user, identityFile: privateKeyPath, comment: name });
+  trail.configBlock = { alias, host: connHost };
   ok(`已追加 ~/.ssh/config:ssh ${alias}`);
   try {
-    const r = await addToKnownHosts(host, port);
+    const r = await addToKnownHosts(connHost, port);
     ok(r === 'added' ? 'known_hosts 已更新' : 'known_hosts 已有条目,跳过');
   } catch (err) {
     warn(`known_hosts 写入失败(不影响使用): ${err.message.split('\n')[0]}`);
@@ -174,7 +224,7 @@ async function main() {
   let mainConn;
   try {
     const v = await connectSSH({
-      host, port, username: user,
+      host: connHost, port, username: user,
       auth: { privateKeyPath },
       passphrase: '',
     });
@@ -225,10 +275,12 @@ async function main() {
   }
 
   try {
-    await renameClient(endpoint, adminApiKey, uuid, name);
-    ok(`节点已命名为 "${name}"`);
+    const fields = { name };
+    if (tags) fields.tags = tags;
+    await updateClient(endpoint, adminApiKey, uuid, fields);
+    ok(`节点已命名为 "${name}"${tags ? `  ${c.dim(`标签: ${tags.split(';').join(', ')}`)}` : ''}`);
   } catch (err) {
-    warn(`节点改名失败(面板中仍是 Auto- 前缀名): ${err.message}`);
+    warn(`节点改名/标签写入失败(面板中仍是 Auto- 前缀名): ${err.message}`);
   }
 
   try {
@@ -259,10 +311,25 @@ async function main() {
 
   // ---------- 总结 ----------
   prompts.print(`\n${c.bold(c.green('初始化完成'))}`);
-  prompts.print(`  SSH      : ${c.bold(`ssh ${alias}`)}  ${c.dim(`(${user}@${host}:${port})`)}`);
+  prompts.print(`  SSH      : ${c.bold(`ssh ${alias}`)}  ${c.dim(`(${user}@${connHost}:${port})`)}`);
   prompts.print(`  密钥     : ${privateKeyPath}`);
-  prompts.print(`  Komari   : ${endpoint}  节点 "${name}"${trail.komariUuid ? `  ${c.dim(`uuid ${trail.komariUuid}`)}` : ''}`);
+  prompts.print(`  Komari   : ${endpoint}  节点 "${name}"${tags ? `  ${c.dim(`[${tags.split(';').join(', ')}]`)}` : ''}${trail.komariUuid ? `  ${c.dim(`uuid ${trail.komariUuid}`)}` : ''}`);
   prompts.close();
+}
+
+// 标签问询:常用模板来自已注册节点(名称分段 + 已设 tags)
+async function askTags(templates) {
+  let raw;
+  if (templates.length > 0) {
+    prompts.print(`  ${c.dim('常用标签(来自已注册节点):')}`);
+    templates.slice(0, 12).forEach((t, i) => prompts.print(`    ${c.cyan(String(i + 1))}. ${t}`));
+    raw = await prompts.ask('标签(选择编号,空格分隔可多选;或直接输入;回车跳过)');
+  } else {
+    raw = await prompts.ask('节点标签(可选,多个用 ; 分隔,如:香港;测试)');
+  }
+  const tags = parseTagInput(raw, templates);
+  if (tags) ok(`标签: ${tags.split(';').join(', ')}`);
+  return tags;
 }
 
 function agentInstallCmd(script, endpoint, token) {
