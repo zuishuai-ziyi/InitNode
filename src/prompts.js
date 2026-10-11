@@ -80,6 +80,9 @@ export async function choose(question, options) {
 // 交给交互式远端程序(如 NodeQuality)前关闭 readline,避免抢占 stdin。
 export function close() {
   rl.close();
+  // rl.close() 会把 stdin 置于 paused 且不再恢复;必须显式 resume,
+  // 否则后续把 stdin 让给远端交互(如 NodeQuality PTY)时一个字节都收不到。
+  process.stdin.resume();
 }
 
 export function print(msg) {

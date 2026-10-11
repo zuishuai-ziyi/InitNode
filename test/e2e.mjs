@@ -33,6 +33,7 @@ const mock = {
   editBody: null,         // 最后一次 /edit 的完整 body
   listRequests: 0,
   detectCalls: 0,         // 公网 IP 探测命令被调用次数
+  nqInput: null,          // NodeQuality 交互阶段收到的远端输入
 };
 
 function resetMock() {
@@ -43,6 +44,7 @@ function resetMock() {
   mock.editBody = null;
   mock.listRequests = 0;
   mock.detectCalls = 0;
+  mock.nqInput = null;
 }
 
 // ---------- mock SSH 服务器 ----------
@@ -66,6 +68,9 @@ function startMockSsh() {
       // ssh2 服务器要求:先 accept session 通道,再在其上处理 exec
       client.on('session', (accept) => {
         const session = accept();
+        // ssh2 服务端事件名为 'pty'(非 'pty-req'),无监听器会直接拒绝导致客户端报
+        // “Unable to request a pseudo-terminal”——execInteractive 必须依赖它
+        session.on('pty', (acceptPty) => acceptPty());
         session.on('exec', (accept2, reject2, info) => {
           const stream = accept2();
           const cmd = info.command || '';
@@ -105,6 +110,20 @@ function startMockSsh() {
               stream.write('[mock-agent] installed\n');
               stream.exit(0);
               stream.end();
+            });
+          } else if (cmd.includes('run.NodeQuality.com')) {
+            // NodeQuality:交互式 PTY 场景,收到 'q' 后结束
+            mock.nqInput = '';
+            let nqDone = false;
+            stream.write('[mock-nq] press q to continue: ');
+            stream.on('data', (d) => {
+              mock.nqInput += d.toString();
+              if (!nqDone && mock.nqInput.includes('q')) {
+                nqDone = true;
+                stream.write('NQ-INPUT-OK\n');
+                stream.exit(0);
+                stream.end();
+              }
             });
           } else {
             stream.stderr.write(`mock-ssh: unhandled command: ${cmd}\n`);
@@ -199,7 +218,7 @@ try {
   t('负例:错误密码提示认证失败', /认证失败/.test(err.message));
 }
 
-async function runScenario(label, answers) {
+async function runScenario(label, answers, { interact = null } = {}) {
   resetMock();
   console.log(`\n[e2e] 场景: ${label}`);
   const tmpSsh = fs.mkdtempSync(path.join(os.tmpdir(), 'initnode-e2e-'));
@@ -224,12 +243,28 @@ async function runScenario(label, answers) {
   child.stderr.on('data', (d) => { errOut += d; });
   const exited = new Promise((resolve) => child.on('close', (c) => resolve([c])));
   child.stdin.write(answers.join('\n') + '\n');
+  // 供交互场景用:轮询 stdout 直到出现指定子串
+  const waitFor = (substr, timeoutMs = 30_000) => new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const poll = () => {
+      if (out.includes(substr)) return resolve();
+      if (Date.now() - t0 > timeoutMs) {
+        return reject(new Error(`waitFor 超时: ${substr}\n---- stdout ----\n${out.split('\n').slice(-30).join('\n')}`));
+      }
+      setTimeout(poll, 50);
+    };
+    poll();
+  });
+  const interactPromise = interact ? interact({ stdin: child.stdin, waitFor }) : null;
   const timeout = setTimeout(() => {
     console.error('\n[e2e] 超时!子进程输出如下:\n---- stdout ----\n' + out);
     console.error('---- stderr ----\n' + errOut);
     child.kill();
   }, 60_000);
   const [code] = await exited;
+  if (interactPromise) {
+    try { await interactPromise; } catch (e) { console.error('[e2e] interact 错误:', e.message); }
+  }
   clearTimeout(timeout);
   child.stdout.destroy();
   child.stderr.destroy();
@@ -336,6 +371,37 @@ async function runScenario(label, answers) {
 
   if (!failed) {
     try { fs.rmSync(tmpSsh, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  }
+}
+
+// ---- 场景 3:NodeQuality 交互输入转发(回归:prompts.close() 后 stdin 必须仍能流入远端) ----
+{
+  const NAME3 = 'E2E交互节点';
+  const { code: code3, out: out3, tmpSsh: tmpSsh3 } = await runScenario('NodeQuality 交互输入转发', [
+    '127.0.0.1',       // 服务器地址
+    String(sshPort),   // SSH 端口
+    '',                // SSH 用户名(默认 root)
+    '1',               // 认证方式:密码
+    PASSWORD,          // SSH 密码
+    'n',               // 关闭自动探测公网 IP
+    'y',               // 信任主机指纹
+    NAME3,             // 节点名称
+    '',                // 标签:跳过
+    'y',               // 运行 NodeQuality
+  ], {
+    interact: async ({ stdin, waitFor }) => {
+      await waitFor('[mock-nq]');
+      stdin.write('q');
+      await waitFor('NQ-INPUT-OK');
+    },
+  });
+  t('S3 进程退出码 0', code3 === 0);
+  if (typeof mock.nqInput !== 'string') {
+  }
+  t('S3 NodeQuality 交互输入已到达远端', typeof mock.nqInput === 'string' && mock.nqInput.includes('q'));
+  t('S3 远端确认收到输入', out3.includes('NQ-INPUT-OK'));
+  if (!failed) {
+    try { fs.rmSync(tmpSsh3, { recursive: true, force: true }); } catch { /* 忽略 */ }
   }
 }
 

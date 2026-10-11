@@ -45,8 +45,16 @@ const fail = (msg) => prompts.print(`  ${c.red('×')} ${msg}`);
 
 function die(msg) {
   fail(msg);
+  finish(1);
+}
+
+// 统一出口:readline close 后 stdin 已被 resume,若不销毁会一直等 stdin EOF 导致进程挂住。
+// 先销毁 stdin,再留 100ms 兜底强制退出(正常情况下事件循环自然排空,stdout 冲刷不受影响)。
+function finish(code) {
+  process.exitCode = code;
   prompts.close();
-  process.exitCode = 1;
+  process.stdin.destroy();
+  setTimeout(() => process.exit(code), 100);
 }
 
 function expandHome(p) {
@@ -314,7 +322,7 @@ async function main() {
   prompts.print(`  SSH      : ${c.bold(`ssh ${alias}`)}  ${c.dim(`(${user}@${connHost}:${port})`)}`);
   prompts.print(`  密钥     : ${privateKeyPath}`);
   prompts.print(`  Komari   : ${endpoint}  节点 "${name}"${tags ? `  ${c.dim(`[${tags.split(';').join(', ')}]`)}` : ''}${trail.komariUuid ? `  ${c.dim(`uuid ${trail.komariUuid}`)}` : ''}`);
-  prompts.close();
+  finish(0);
 }
 
 // 标签问询:常用模板来自已注册节点(名称分段 + 已设 tags)

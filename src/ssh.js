@@ -168,6 +168,7 @@ export function execInteractive(conn, cmd, { term = 'xterm-256color', onChunk = 
         process.stdin.setRawMode?.(true);
       } catch { /* 非终端环境 */ }
       const onData = (buf) => stream.write(buf);
+      process.stdin.resume(); // readline close 后 stdin 可能处于 paused,显式恢复流动
       process.stdin.on('data', onData);
 
       const cleanup = () => {
