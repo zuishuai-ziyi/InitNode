@@ -1,0 +1,17 @@
+{
+  "name": "initnode",
+  "version": "0.1.0",
+  "description": "新云服务器初始化 CLI：生成/上传 SSH 密钥、注册 Komari 监控（自动发现）、跑 NodeQuality 质量检测",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node test/unit.mjs && node test/e2e.mjs"
+  },
+  "dependencies": {
+    "ssh2": "^1.17.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
