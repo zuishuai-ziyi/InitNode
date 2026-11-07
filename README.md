@@ -1,3 +1,4 @@
+（本项目使用 GLM 5.3, DeepSeek-V4, MiniMax-M3 等模型构建）
 # initnode —— 新云服务器初始化 CLI
 
 一条命令完成新云服务器的接入:生成并部署 SSH 密钥、注册到 Komari 监控(自动发现)、可选安装厂商监控清理服务(agent-guard)、可选跑 NodeQuality 质量检测。
