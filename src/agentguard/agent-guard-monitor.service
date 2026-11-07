@@ -1,0 +1,12 @@
+[Unit]
+Description=agent-guard monitor: instant reaction to vendor agent process creation (kernel proc connector)
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/modprobe cn_proc
+ExecStart=/usr/bin/python3 /usr/local/bin/agent-guard-monitor.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

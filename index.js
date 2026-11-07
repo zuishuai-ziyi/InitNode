@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // initnode —— 新云服务器初始化 CLI
 // 流程:Komari 配置 → 连接信息问询 → 连接(TOFU,可选探测公网 IP)→ 节点名称/标签/SSH 密钥
-//       → 公钥部署 + ssh config/known_hosts → 新密钥验证 → Komari 注册(名称+标签)+ agent
+//       → 公钥部署 + ssh config/known_hosts → 新密钥验证 → Komari 注册(名称+标签)+ agent → 厂商监控清理服务(可选)
 //       → NodeQuality 质量检测
 import path from 'node:path';
 import os from 'node:os';
@@ -22,10 +22,12 @@ import {
   fetchAutoDiscoveryKey, fetchClients, registerClient, updateClient, waitForOnline,
 } from './src/komari.js';
 import { runNodeQuality } from './src/nodequality.js';
+import { installAgentGuard } from './src/agentguard.js';
 import {
   detectPublicIP, normalizeHost, isPrivateOrLocalIP,
 } from './src/publicip.js';
 import { deriveTagTemplates, parseTagInput } from './src/tags.js';
+import { ensurePubkeyAuth } from './src/sshd.js';
 
 const c = {
   dim: (s) => `\x1b[2m${s}\x1b[0m`,
@@ -64,7 +66,7 @@ function expandHome(p) {
 }
 
 // 运行中产生的痕迹,失败时提示/回滚
-const trail = { keyCreated: null, configBlock: null, komariUuid: null };
+const trail = { keyCreated: null, configBlock: null, komariUuid: null, agentGuard: false };
 
 const TOTAL = 7;
 
@@ -203,6 +205,13 @@ async function main() {
     return die(`公钥上传失败: ${normalizeSshError(err)}`);
   }
 
+  // 顺手确认服务器 sshd 允许公钥登录(被禁用则自动启用,失败不阻塞,步骤 6 还有一次兜底)
+  try {
+    reportSshdFix(await ensurePubkeyAuth(conn, { user, pubkey: pubKey }));
+  } catch (err) {
+    prompts.print(`  ${c.dim(`sshd 配置自检跳过: ${String(err.message).split('\n')[0]}`)}`);
+  }
+
   // 短别名(惯例:IPv4 首段 / IPv6 首组),冲突时另指定
   let alias = deriveAlias(connHost);
   const tokens = existingTokens();
@@ -230,22 +239,49 @@ async function main() {
   // ---------- [6/7] 新密钥验证(保留连接供后续步骤复用) ----------
   step(6, TOTAL, '用新密钥验证登录');
   let mainConn;
-  try {
-    const v = await connectSSH({
-      host: connHost, port, username: user,
-      auth: { privateKeyPath },
-      passphrase: '',
-    });
-    const { code } = await execSSH(v.conn, 'echo ok');
-    if (code !== 0) {
-      v.conn.end();
-      throw new Error('echo 校验失败');
+  let verifyErr = null;
+  for (let attempt = 1; attempt <= 2 && !mainConn; attempt++) {
+    try {
+      const v = await connectSSH({
+        host: connHost, port, username: user,
+        auth: { privateKeyPath },
+        passphrase: '',
+      });
+      const { code } = await execSSH(v.conn, 'echo ok');
+      if (code !== 0) {
+        v.conn.end();
+        throw new Error('echo 校验失败');
+      }
+      mainConn = v.conn;
+    } catch (err) {
+      verifyErr = err;
     }
-    mainConn = v.conn;
-    ok(`新密钥登录成功(此后可 ${c.bold(`ssh ${alias}`)} 直连)`);
-  } catch (err) {
-    return die(`新密钥验证失败: ${normalizeSshError(err)}\n  ${c.dim('注意:authorized_keys 已写入,可手动 ssh -i 排查;中止后本机痕迹将保留。')}`);
+    if (mainConn || attempt === 2) break;
+
+    // 第一次失败:用首连认证方式重连,自动启用服务器端公钥登录后重试
+    warn(`新密钥验证失败: ${normalizeSshError(verifyErr).message}`);
+    prompts.print(`  ${c.dim('自动排查:检查 sshd 公钥登录 / PermitRootLogin / AuthorizedKeysFile 路径 / 密钥文件权限...')}`);
+    let fixConn = null;
+    try {
+      ({ conn: fixConn } = await connectSSH({ host: connHost, port, username: user, auth, passphrase: firstPassphrase }));
+    } catch (err) {
+      warn(`无法用原认证方式重新连接,跳过自动修复(${normalizeSshError(err).message})`);
+      break;
+    }
+    try {
+      reportSshdFix(await ensurePubkeyAuth(fixConn, { user, pubkey: pubKey }));
+      await installPubKey(fixConn, pubKey); // 幂等:配置/权限修正后重写一遍,确保内容与路径都对
+      ok('已重新写入 authorized_keys');
+    } catch (err) {
+      warn(`自动修复未完成: ${String(err.message).split('\n')[0]}`);
+    } finally {
+      fixConn.end();
+    }
   }
+  if (!mainConn) {
+    return die(`新密钥验证失败: ${normalizeSshError(verifyErr)}\n  ${c.dim('注意:authorized_keys 已写入,可手动 ssh -i 排查;中止后本机痕迹将保留。')}`);
+  }
+  ok(`新密钥登录成功(此后可 ${c.bold(`ssh ${alias}`)} 直连)`);
 
   // ---------- [7/7] Komari 注册 + agent ----------
   step(7, TOTAL, 'Komari 注册与 agent 安装');
@@ -299,6 +335,26 @@ async function main() {
     warn(err.message);
   }
 
+  // ---------- 厂商监控清理服务(可选,失败不阻塞) ----------
+  prompts.print('');
+  if (await prompts.confirm('安装厂商监控清理服务 agent-guard?(自动清除 qemu-guest-agent/open-vm-tools/lxd 等厂商代理,不碰 komari)', true)) {
+    prompts.print('  写入清理脚本与 systemd 单元(开机清理 + 秒级进程触发 + 每分钟兑底)...');
+    try {
+      const r = await installAgentGuard(mainConn);
+      if (!r.systemd) {
+        warn('服务器无 systemd,已跳过 agent-guard 安装');
+      } else {
+        trail.agentGuard = true;
+        if (r.monitor) ok('agent-guard 已安装:清理脚本 + 开机单元 + 秒级监听(python3) + 每分钟 timer');
+        else ok('agent-guard 已安装:清理脚本 + 开机单元 + 每分钟 timer(无 python3,秒级监听跳过)');
+      }
+    } catch (err) {
+      warn(`agent-guard 安装失败(不影响其他步骤): ${err.message}`);
+    }
+  } else {
+    warn('已跳过 agent-guard 清理服务');
+  }
+
   // ---------- [8] NodeQuality ----------
   prompts.print('');
   if (await prompts.confirm('运行 NodeQuality 节点质量检测?(约 5-15 分钟)', true)) {
@@ -322,7 +378,28 @@ async function main() {
   prompts.print(`  SSH      : ${c.bold(`ssh ${alias}`)}  ${c.dim(`(${user}@${connHost}:${port})`)}`);
   prompts.print(`  密钥     : ${privateKeyPath}`);
   prompts.print(`  Komari   : ${endpoint}  节点 "${name}"${tags ? `  ${c.dim(`[${tags.split(';').join(', ')}]`)}` : ''}${trail.komariUuid ? `  ${c.dim(`uuid ${trail.komariUuid}`)}` : ''}`);
+  if (trail.agentGuard) prompts.print(`  清理服务 : agent-guard  ${c.dim('(自动清除厂商监控代理,日志 /var/log/agent-guard.log)')}`);
   finish(0);
+}
+
+// 打印 sshd 公钥登录自检/修复结果
+function reportSshdFix(r) {
+  if (!r) return;
+  if (r.unknown) {
+    prompts.print(`  ${c.dim(`sshd 公钥登录自检跳过: ${r.reason}`)}`);
+    return;
+  }
+  if (r.already) {
+    prompts.print(`  ${c.dim('sshd 已允许公钥登录')}`);
+    return;
+  }
+  for (const s of r.steps || []) prompts.print(`    ${c.dim(`- ${s}`)}`);
+  if (r.ok) {
+    ok('服务器 sshd 原本不允许公钥登录,已自动启用(PubkeyAuthentication yes,密码登录保持不变)');
+  } else {
+    const hint = r.reason === 'no-privilege' ? '(需要 root 或免密 sudo 才能改 sshd 配置)' : '';
+    warn(`自动启用公钥登录未成功: ${r.reason || '未知原因'}${hint}`);
+  }
 }
 
 // 标签问询:常用模板来自已注册节点(名称分段 + 已设 tags)

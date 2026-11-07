@@ -1,0 +1,9 @@
+[Unit]
+Description=agent-guard: purge cloud vendor guest agents (boot run; timer repeats every minute)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agent-guard.sh
+
+[Install]
+WantedBy=multi-user.target

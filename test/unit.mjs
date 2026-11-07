@@ -17,6 +17,11 @@ const { hostKeyFingerprint } = await import('../src/ssh.js');
 const { extractReportUrl } = await import('../src/nodequality.js');
 const { normalizeTags, parseTagInput, deriveTagTemplates } = await import('../src/tags.js');
 const { isValidIP, isPrivateOrLocalIP, normalizeHost, DETECT_PUBLIC_IP_CMD } = await import('../src/publicip.js');
+const { buildAgentGuardBootstrap, AGENT_GUARD_ASSETS } = await import('../src/agentguard.js');
+const {
+  buildInspectScript, parseInspect, buildSshdFixScript, parseFixOutput,
+  resolveAuthorizedKeysPaths, buildKeyPathScript, DROPIN_PATH,
+} = await import('../src/sshd.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -159,6 +164,162 @@ t('DETECT_PUBLIC_IP_CMD: 含多端点与 IP 校验模式', () => {
   assert.ok(DETECT_PUBLIC_IP_CMD.includes('ip.3322.net'), '国内端点');
   assert.ok(DETECT_PUBLIC_IP_CMD.includes('wget'), 'wget 兑底');
   assert.ok(DETECT_PUBLIC_IP_CMD.includes('exit 0'), '提前退出');
+});
+
+// ---- agentguard.js ----
+t('agentguard: bootstrap 写出全部 5 个目标文件', () => {
+  const s = buildAgentGuardBootstrap();
+  [
+    '/usr/local/bin/agent-guard.sh',
+    '/usr/local/bin/agent-guard-monitor.py',
+    '/etc/systemd/system/agent-guard.service',
+    '/etc/systemd/system/agent-guard.timer',
+    '/etc/systemd/system/agent-guard-monitor.service',
+  ].forEach((p) => assert.ok(s.includes(p), p));
+});
+t('agentguard: heredoc 定界符全部加引号(防远端展开)', () => {
+  const s = buildAgentGuardBootstrap();
+  assert.equal((s.match(/<<'AG_[A-Z]+_EOF'/g) || []).length, 5, '5 个带引号定界符');
+  assert.ok(!/<<AG_/.test(s), '不允许无引号定界符');
+});
+t('agentguard: 依赖处理(systemd 必须/flock 缺失去锁/python3 尝试安装)', () => {
+  const s = buildAgentGuardBootstrap();
+  assert.ok(s.includes('command -v systemctl'), 'systemd 检查');
+  assert.ok(s.includes('[ ! -d /run/systemd/system ]'), '运行态检查');
+  assert.ok(s.includes('command -v flock'), 'flock 检查');
+  assert.ok(s.includes("sed -i '/agent-guard\\.lock/d'"), 'flock 缺失自动去锁');
+  assert.ok(s.includes('apt-get install -y python3'), 'apt 安装 python3');
+  assert.ok(s.includes('dnf install -y -q python3'), 'dnf 安装 python3');
+  assert.ok(s.includes('apk add --no-cache python3'), 'apk 安装 python3');
+  assert.ok(s.includes('INITNODE_AG_RESULT systemd='), '结果标记');
+});
+t('agentguard: 内嵌资产关键内容(guard 范围/monitor 偏移修复回归)', () => {
+  const { guard, monitor, oneshotUnit, timerUnit, monitorUnit } = AGENT_GUARD_ASSETS;
+  assert.ok(guard.includes('qemu-guest-agent'), 'guard 覆盖 qemu');
+  assert.ok(guard.includes('open-vm-tools'), 'guard 覆盖 vmware');
+  assert.ok(guard.includes('lxd-agent-loader'), 'guard 覆盖 lxd');
+  assert.ok(guard.includes('NOT touched: komari-agent, cloud-init'), '不碰 komari/cloud-init');
+  assert.ok(guard.includes('flock -n 9'), '并发锁');
+  // netlink cn_proc 解析偏移回归(曾因 cn_msg 头 16/20 字节算错导致全部事件被丢)
+  assert.equal(/CN_MSG_HDRLEN = (\d+)/.exec(monitor)[1], '20');
+  assert.equal(/PROC_WHAT_OFF = (\d+)/.exec(monitor)[1], '0');
+  assert.equal(/PROC_DATA_OFF = (\d+)/.exec(monitor)[1], '16');
+  assert.ok(monitor.includes('PROC_EVENT_EXEC'), '监听 exec 事件');
+  assert.ok(oneshotUnit.includes('ExecStart=/usr/local/bin/agent-guard.sh'));
+  assert.ok(timerUnit.includes('OnCalendar='), 'timer 每分钟');
+  assert.ok(monitorUnit.includes('agent-guard-monitor.py'));
+});
+
+// ---- sshd.js:公钥登录自动启用 ----
+const INSPECT_SAMPLE = [
+  'INITNODE_SSHD priv=root',
+  'INITNODE_SSHD home=/root',
+  'INITNODE_SSHD sshd=/usr/sbin/sshd',
+  'INITNODE_SSHD config=/etc/ssh/sshd_config',
+  'INITNODE_SSHD include=no',
+  'INITNODE_SSHD dropin=no',
+  'INITNODE_SSHD raw_pubkey_no=yes',
+  'INITNODE_SSHD raw_root_no=yes',
+  'INITNODE_SSHD effective_pubkey=no',
+  'INITNODE_SSHD effective_password=yes',
+  'INITNODE_SSHD effective_permitrootlogin=no',
+  'INITNODE_SSHD effective_authorizedkeysfile=.ssh/authorized_keys /etc/ssh/keys/%u',
+  'INITNODE_SSHD effective_authenticationmethods=',
+  'INITNODE_SSHD effective_allowusers=root deploy',
+  'INITNODE_SSHD effective_denyusers=',
+  'INITNODE_SSHD effective_allowgroups=',
+  'INITNODE_SSHD effective_denygroups=',
+  'INITNODE_SSHD selinux=none',
+  'INITNODE_SSHD END',
+  '',
+].join('\n');
+
+t('sshd: parseInspect 解析诊断输出(含带空格的值)', () => {
+  const s = parseInspect(INSPECT_SAMPLE);
+  assert.equal(s.known, true);
+  assert.equal(s.priv, 'root');
+  assert.equal(s.home, '/root');
+  assert.equal(s.include, false);
+  assert.equal(s.rawPubkeyNo, true);
+  assert.equal(s.pubkey, 'no');
+  assert.equal(s.permitRootLogin, 'no');
+  assert.equal(s.authorizedKeysFile, '.ssh/authorized_keys /etc/ssh/keys/%u');
+  assert.equal(s.allowUsers, 'root deploy');
+});
+t('sshd: parseInspect 无标记时 known=false(无权限/无 sshd)', () => {
+  assert.equal(parseInspect('bash: sshd: command not found\n').known, false);
+  assert.equal(parseInspect('').known, false);
+  assert.equal(parseInspect('INITNODE_SSHD priv=root').known, false, '缺 END 视为未完成');
+});
+t('sshd: buildInspectScript 只读且覆盖关键字段', () => {
+  const s = buildInspectScript();
+  assert.ok(s.includes('sshd'), 'sshd');
+  assert.ok(s.includes('-T'), 'sshd -T 取生效值');
+  assert.ok(s.includes('effective_pubkey='), 'pubkey 字段');
+  assert.ok(s.includes('effective_authorizedkeysfile='), 'authorizedkeysfile 字段');
+  assert.ok(s.includes('note "END"'), '结束标记');
+  assert.ok(!/>\s*\/etc\/ssh/.test(s), '不得写 /etc/ssh');
+});
+t('sshd: buildSshdFixScript 写 drop-in + 校验 + 回滚 + 重载', () => {
+  const s = buildSshdFixScript({ permitRootLogin: true });
+  assert.ok(s.includes(DROPIN_PATH), 'drop-in 路径');
+  assert.ok(s.includes("echo 'PubkeyAuthentication yes'"), 'PubkeyAuthentication yes');
+  assert.ok(s.includes('PermitRootLogin prohibit-password'), 'root 被拒时補 prohibit-password');
+  assert.ok(s.includes('sshd_config.bak'), '备份');
+  assert.ok(s.includes('"/usr/sbin/sshd" -t -f "$CFG"') || s.includes('"$SSHD" -t -f "$CFG"'), 'sshd -t 校验');
+  assert.ok(s.includes('reason=config-invalid'), '校验失败标记');
+  assert.ok(s.includes('systemctl reload sshd'), '重载候选');
+  assert.ok(s.includes('restorecon'), 'SELinux 标签修复');
+  assert.ok(!s.includes('PasswordAuthentication'), '不碰密码登录');
+});
+t('sshd: buildSshdFixScript 不强制补 PermitRootLogin', () => {
+  const s = buildSshdFixScript({ permitRootLogin: false });
+  assert.ok(!s.includes('PermitRootLogin prohibit-password'), '不需要时不加');
+});
+t('sshd: parseFixOutput 解析 STEP/RESULT', () => {
+  const out = [
+    'INITNODE_SSHD STEP include-added',
+    'INITNODE_SSHD STEP reload=systemctl reload ssh',
+    'INITNODE_SSHD STEP effective pubkey=yes permitrootlogin=prohibit-password',
+    'INITNODE_SSHD RESULT ok=yes',
+  ].join('\n');
+  const r = parseFixOutput(out);
+  assert.equal(r.ok, true);
+  assert.equal(r.reload, 'systemctl reload ssh');
+  assert.equal(r.steps.length, 3);
+  assert.ok(r.steps[1].includes('已重载'), r.steps[1]);
+  assert.equal(parseFixOutput('INITNODE_SSHD RESULT ok=no reason=no-privilege').reason, 'no-privilege');
+  assert.equal(parseFixOutput('garbage').ok, false);
+});
+t('sshd: resolveAuthorizedKeysPaths 展开 %h/%u 与默认值', () => {
+  assert.deepEqual(
+    resolveAuthorizedKeysPaths('.ssh/authorized_keys .ssh/authorized_keys2', { home: '/root', user: 'root' }),
+    ['/root/.ssh/authorized_keys', '/root/.ssh/authorized_keys2'],
+  );
+  assert.deepEqual(
+    resolveAuthorizedKeysPaths('/etc/ssh/keys/%u %h/.ssh/ak', { home: '/home/deploy', user: 'deploy' }),
+    ['/etc/ssh/keys/deploy', '/home/deploy/.ssh/ak'],
+  );
+  assert.deepEqual(
+    resolveAuthorizedKeysPaths('', { home: '/root', user: 'root' }),
+    ['/root/.ssh/authorized_keys', '/root/.ssh/authorized_keys2'],
+  );
+  assert.deepEqual(resolveAuthorizedKeysPaths('.ssh/authorized_keys', {}), [], '未知 home 时不给相对路径');
+});
+t('sshd: buildKeyPathScript 带引号路径 + 带引号 heredoc + 幂等去重', () => {
+  const s = buildKeyPathScript(['/etc/ssh/keys/a b', '/root/.ssh/authorized_keys'], 'ssh-ed25519 AAAA test@x');
+  assert.ok(s.includes("for P in '/etc/ssh/keys/a b' '/root/.ssh/authorized_keys'; do"), '路径引用');
+  assert.ok(s.includes("<<'INITNODE_KEY_EOF'"), '带引号 heredoc(防远端展开)');
+  assert.ok(s.includes('grep -qxF "$KEYLINE"'), '幂等去重');
+  assert.ok(s.includes('chmod 600'), '权限修正');
+  assert.ok(s.includes('reason=key-path-write-failed'), '写入失败上报');
+});
+t('sshd: 脚本均为纯 POSIX sh(不依赖 bash 语法)', () => {
+  for (const s of [buildInspectScript(), buildSshdFixScript({ permitRootLogin: true }), buildKeyPathScript(['/x'], 'k')]) {
+    assert.ok(s.startsWith('#!/bin/sh'), 'shebang');
+    assert.ok(!/\[\[ /.test(s), '不得使用 [[ ]]');
+    assert.ok(!/<<</.test(s), '不得使用 herestring');
+  }
 });
 
 console.log(`\n[unit] ${passed} 项通过${process.exitCode ? '(存在失败)' : ''}`);

@@ -1,0 +1,9 @@
+[Unit]
+Description=agent-guard: run vendor-agent sweep every minute (cron-less fallback)
+
+[Timer]
+OnCalendar=*-*-* *:*:30
+Unit=agent-guard.service
+
+[Install]
+WantedBy=timers.target

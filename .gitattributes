@@ -1,0 +1,5 @@
+# 远端资产(会被读入并推送到 Linux 执行)必须保持 LF,否则 shebang 变成 #!/bin/sh\r
+*.sh      text eol=lf
+*.py      text eol=lf
+*.service text eol=lf
+*.timer   text eol=lf

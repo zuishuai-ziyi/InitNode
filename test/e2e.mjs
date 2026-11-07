@@ -34,6 +34,12 @@ const mock = {
   listRequests: 0,
   detectCalls: 0,         // 公网 IP 探测命令被调用次数
   nqInput: null,          // NodeQuality 交互阶段收到的远端输入
+  agentGuardInput: null,  // agent-guard 清理服务安装脚本收到的远端输入
+  // —— sshd 公钥登录闸门(场景 4) ——
+  enforcePubkeyGate: false, // true 时:未执行过 fix 脚本前拒绝 publickey 认证
+  sshdPubkeyEnabled: false, // fix 脚本执行后置 true(模拟 PubkeyAuthentication no → yes)
+  sshdFixInput: null,       // 收到的 sshd 修复脚本内容
+  inspectCalls: 0,          // sshd 诊断脚本被调用次数
 };
 
 function resetMock() {
@@ -45,6 +51,11 @@ function resetMock() {
   mock.listRequests = 0;
   mock.detectCalls = 0;
   mock.nqInput = null;
+  mock.agentGuardInput = null;
+  mock.enforcePubkeyGate = false;
+  mock.sshdPubkeyEnabled = false;
+  mock.sshdFixInput = null;
+  mock.inspectCalls = 0;
 }
 
 // ---------- mock SSH 服务器 ----------
@@ -59,6 +70,11 @@ function startMockSsh() {
         return ctx.accept();
       }
       if (ctx.method === 'publickey') {
+        // 场景 4 的闸门:服务器没启用公钥登录时拒绝 publickey(真实故障的模拟)
+        if (mock.enforcePubkeyGate && !mock.sshdPubkeyEnabled) {
+          mock.authSequence.push('publickey-rejected');
+          return ctx.reject();
+        }
         mock.authSequence.push('publickey');
         return ctx.accept();
       }
@@ -104,6 +120,57 @@ function startMockSsh() {
             stream.write('ok\n');
             stream.exit(0);
             stream.end();
+          } else if (cmd.includes('initnode-sshd-inspect')) {
+            // sshd 公钥登录诊断脚本(场景 4):用闸门状态模拟"PubkeyAuthentication no"
+            mock.inspectCalls++;
+            const pk = mock.sshdPubkeyEnabled ? 'yes' : 'no';
+            stream.write([
+              'INITNODE_SSHD priv=root',
+              'INITNODE_SSHD home=/root',
+              'INITNODE_SSHD sshd=/usr/sbin/sshd',
+              'INITNODE_SSHD config=/etc/ssh/sshd_config',
+              'INITNODE_SSHD include=no',
+              'INITNODE_SSHD dropin=no',
+              'INITNODE_SSHD raw_pubkey_no=yes',
+              'INITNODE_SSHD raw_root_no=yes',
+              `INITNODE_SSHD effective_pubkey=${pk}`,
+              'INITNODE_SSHD effective_password=yes',
+              `INITNODE_SSHD effective_permitrootlogin=${mock.sshdPubkeyEnabled ? 'prohibit-password' : 'no'}`,
+              'INITNODE_SSHD effective_authorizedkeysfile=.ssh/authorized_keys',
+              'INITNODE_SSHD effective_authenticationmethods=',
+              'INITNODE_SSHD effective_allowusers=',
+              'INITNODE_SSHD effective_denyusers=',
+              'INITNODE_SSHD effective_allowgroups=',
+              'INITNODE_SSHD effective_denygroups=',
+              'INITNODE_SSHD selinux=none',
+              'INITNODE_SSHD END',
+            ].join('\n') + '\n');
+            stream.exit(0);
+            stream.end();
+          } else if (cmd.includes('initnode-sshd-fix')) {
+            // sshd 修复脚本(场景 4):执行后公钥登录变为可用
+            drain((input) => {
+              mock.sshdFixInput = input;
+              mock.sshdPubkeyEnabled = true;
+              stream.write([
+                'INITNODE_SSHD STEP include-added',
+                'INITNODE_SSHD STEP dropin-written',
+                'INITNODE_SSHD STEP validated',
+                'INITNODE_SSHD STEP reload=systemctl reload sshd',
+                'INITNODE_SSHD STEP effective pubkey=yes permitrootlogin=prohibit-password',
+                'INITNODE_SSHD RESULT ok=yes',
+              ].join('\n') + '\n');
+              stream.exit(0);
+              stream.end();
+            });
+          } else if (cmd.trim() === 'bash -s') {
+            // agent-guard 清理服务安装脚本(stdin 送入 bootstrap)
+            drain((input) => {
+              mock.agentGuardInput = input;
+              stream.write('ag-guard: ok\nINITNODE_AG_RESULT systemd=yes monitor=yes\n');
+              stream.exit(0);
+              stream.end();
+            });
           } else if (cmd.includes('bash -s --')) {
             drain((input) => {
               mock.agentInstallInput = input;
@@ -218,8 +285,9 @@ try {
   t('负例:错误密码提示认证失败', /认证失败/.test(err.message));
 }
 
-async function runScenario(label, answers, { interact = null } = {}) {
+async function runScenario(label, answers, { interact = null, setup = null } = {}) {
   resetMock();
+  if (setup) setup();
   console.log(`\n[e2e] 场景: ${label}`);
   const tmpSsh = fs.mkdtempSync(path.join(os.tmpdir(), 'initnode-e2e-'));
   const tmpConfig = path.join(tmpSsh, 'initnode-config.json');
@@ -291,6 +359,7 @@ async function runScenario(label, answers, { interact = null } = {}) {
     '',                // 公网 IP 用途:默认 1(仅密钥命名,连接地址不变)
     NAME,              // 节点名称
     '2',               // 标签:选模板 2(香港)
+    'y',               // 安装 agent-guard 清理服务
     'n',               // 跳过 NodeQuality
   ]);
 
@@ -326,6 +395,11 @@ async function runScenario(label, answers, { interact = null } = {}) {
   t('S1 Komari 注册名为节点名称', mock.registeredName === NAME);
   t('S1 edit 写入名称+标签(模板「香港」)', mock.editBody?.name === NAME && mock.editBody?.tags === '香港');
   t('S1 安装脚本内容已通过 stdin 送入远端', mock.agentInstallInput === INSTALL_SH);
+  t('S1 agent-guard bootstrap 已通过 stdin 送入远端', (() => {
+    const i = mock.agentGuardInput || '';
+    return i.includes('/usr/local/bin/agent-guard.sh') && i.includes('INITNODE_AG_RESULT');
+  })());
+  t('S1 输出包含 agent-guard 安装成功', out.includes('agent-guard 已安装'));
   t('S1 client/list 被轮询(等待上线)', mock.listRequests >= 1);
   t('S1 输出包含初始化完成', out.includes('初始化完成'));
   t('S1 输出包含公钥安装成功', out.includes('公钥已写入'));
@@ -349,6 +423,7 @@ async function runScenario(label, answers, { interact = null } = {}) {
     'y',               // 信任主机指纹
     NAME,              // 节点名称
     '美国;CN 云',       // 自定义标签
+    'y',               // 安装 agent-guard 清理服务
     'n',               // 跳过 NodeQuality
   ]);
 
@@ -367,6 +442,7 @@ async function runScenario(label, answers, { interact = null } = {}) {
   })());
   t('S2 Komari 注册名为节点名称', mock.registeredName === NAME);
   t('S2 edit 写入名称+自定义标签', mock.editBody?.name === NAME && mock.editBody?.tags === '美国;CN 云');
+  t('S2 agent-guard bootstrap 已送入远端且输出安装成功', (mock.agentGuardInput || '').includes('agent-guard.sh') && out.includes('agent-guard 已安装'));
   t('S2 输出包含初始化完成', out.includes('初始化完成'));
 
   if (!failed) {
@@ -387,6 +463,7 @@ async function runScenario(label, answers, { interact = null } = {}) {
     'y',               // 信任主机指纹
     NAME3,             // 节点名称
     '',                // 标签:跳过
+    'y',               // 安装 agent-guard 清理服务
     'y',               // 运行 NodeQuality
   ], {
     interact: async ({ stdin, waitFor }) => {
@@ -405,7 +482,41 @@ async function runScenario(label, answers, { interact = null } = {}) {
   }
 }
 
+// ---- 场景 4:服务器禁用公钥登录 → 脚本自动启用(reportSshdFix 主动修复路径) ----
+{
+  const NAME4 = 'E2E公钥闸门节点';
+  const { code: code4, out: out4, tmpSsh: tmpSsh4 } = await runScenario('服务器禁用公钥登录→自动启用', [
+    '127.0.0.1',       // 服务器地址
+    String(sshPort),   // SSH 端口
+    '',                // SSH 用户名(默认 root)
+    '1',               // 认证方式:密码
+    PASSWORD,          // SSH 密码
+    'n',               // 关闭自动探测公网 IP
+    'y',               // 信任主机指纹
+    NAME4,             // 节点名称
+    '',                // 标签:跳过
+    'n',               // 跳过 agent-guard(缩短路径)
+    'n',               // 跳过 NodeQuality
+  ], {
+    // 开启闸门:只有 fix 脚本跑过,publickey 认证才被接受
+    setup: () => { mock.enforcePubkeyGate = true; },
+  });
+  t('S4 进程退出码 0', code4 === 0);
+  t('S4 执行了 sshd 诊断脚本', mock.inspectCalls >= 1);
+  t('S4 执行了 sshd 修复脚本', typeof mock.sshdFixInput === 'string' && mock.sshdFixInput.length > 0);
+  t('S4 修复脚本含 PubkeyAuthentication yes', /PubkeyAuthentication yes/.test(mock.sshdFixInput || ''));
+  t('S4 修复脚本写入 drop-in 配置', /sshd_config\.d\/.+\.conf/.test(mock.sshdFixInput || ''));
+
+  t('S4 提示已自动启用公钥登录', out4.includes('已自动启用'));
+  t('S4 新密钥登录成功', out4.includes('新密钥登录成功'));
+  t('S4 公钥认证未被拒(修复在验证前生效)', !mock.authSequence.includes('publickey-rejected'));
+  if (!failed) {
+    try { fs.rmSync(tmpSsh4, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  }
+}
+
 sshServer.close();
 komariServer.close();
 console.log(failed ? '\n[e2e] 存在失败项' : `\n[e2e] 全部通过(tmp 已清理)`);
 process.exit(failed ? 1 : 0);
+
