@@ -18,6 +18,13 @@ initnode -h        # 帮助
 
 不注册也可以 `npm start` / `node index.js` 运行。
 
+已发布到 npm(`@zuishuai-ziyi/initnode`),非开发机可以直接装:
+
+```powershell
+npm install -g @zuishuai-ziyi/initnode   # 或 npx @zuishuai-ziyi/initnode
+initnode
+```
+
 按提示依次输入:
 
 1. **Komari 面板地址**(默认本家实例)与**管理员 API Key**(WebUI → 个人设置/安全 中创建,格式 `komari-xxxx`;首次输入后存入项目根 `config.json`,已被 .gitignore 排除)
@@ -118,6 +125,36 @@ npm test
 - `test/e2e.mjs`:内置 mock SSH 服务器(ssh2.Server)+ mock Komari 面板,管道喂入答案跑通全流程;含 4 个场景:①探测公网 IP+模板标签 ②关闭探测+自定义标签 ③NodeQuality 交互输入转发 ④**服务器禁用公钥登录→自动启用**(mock 在修复脚本执行前拒绝 publickey 认证)。不触真实 `~/.ssh` 与真实面板
 
 测试重定向用的环境变量:`INITNODE_SSH_DIR`、`INITNODE_CONFIG`、`INITNODE_AGENT_INSTALL_URLS`(逗号分隔的安装脚本源列表)。
+
+## 发布(npm)
+
+包名 `@zuishuai-ziyi/initnode`,命令仍是 `initnode`(npm 上的 `initnode` 已被他人占用,v1.0.1,故用 scope)。本机 registry 是 npmmirror,发布路径由 `publishConfig.registry` 固定为 `registry.npmjs.org`,不受镜像配置影响。
+
+**首次准备(一次性)**
+
+1. npm 账号需拥有 `zuishuai-ziyi` 这个 scope(`npm login` 后 `npm whoami` 确认用户名一致)
+2. npmjs.com → Access Tokens → Granular Access Token(Read and write,可选择该 scope 或所有包)
+3. GitHub 仓库 Settings → Secrets and variables → Actions → New repository secret,名字 `NPM_TOKEN`,值为上面的 token
+
+**自动发布(CI)**
+
+```powershell
+npm version patch            # 或 minor / major:改 package.json + lock 并打 vX.Y.Z tag
+git push origin main --follow-tags
+```
+
+推 `v*` tag 触发 `.github/workflows/publish.yml`:安装依赖 → `npm test` → 校验 tag 与 `package.json` 版本一致 → `npm pack --dry-run` 预览 → `npm publish --provenance --access public`。
+
+**手动发布**
+
+- Actions → `Publish npm` → Run workflow:默认 `dry-run=true`,只跑测试与打包校验;取消勾选才真正发布
+- 本地校验:`npm run publish:dry`(只打包,不写 registry);确认无误后 `npm login && npm publish --access public`
+
+**注意事项**
+
+- `files` 只打包 `index.js` 与 `src/`,测试、`config.json`、`tmp/` 不会进包
+- `prepublishOnly` 会先跑完整测试,失败则拒绝发布
+- `--provenance` 需要仓库公开 + `permissions: id-token: write`(已在 workflow 配好),npm 包页面会显示「Built and signed on GitHub Actions」
 
 ## 注意事项
 
