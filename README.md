@@ -6,12 +6,17 @@
 ## 用法
 
 ```powershell
-# 首次使用先装依赖
+# 首次使用先装依赖,并注册全局命令 initnode(npm 全局 bin 已在 PATH)
 npm install
+npm link
 
-# 运行
-npm start          # 或 node index.js
+# 之后任意目录直接运行
+initnode
+initnode -V        # 版本号
+initnode -h        # 帮助
 ```
+
+不注册也可以 `npm start` / `node index.js` 运行。
 
 按提示依次输入:
 

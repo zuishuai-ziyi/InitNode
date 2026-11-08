@@ -70,7 +70,41 @@ const trail = { keyCreated: null, configBlock: null, komariUuid: null, agentGuar
 
 const TOTAL = 7;
 
+// ---- 命令行元信息(注册为全局命令后使用;行为对齐 ssh 的 -V / -h)----
+const PKG_VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+
+const USAGE = `usage: initnode [-V] [-h]
+
+交互式初始化一台新云服务器(不带参数即进入流程):
+  1) Komari 面板配置与自动发现密钥
+  2) 服务器连接信息(地址 / 端口 / 用户 / 密码或已有私钥)
+  3) 连接并信任主机指纹(TOFU),可选探测公网 IP
+  4) 节点名称、标签、SSH 密钥(缺失则生成)
+  5) 部署公钥、写 ~/.ssh/config 与 known_hosts
+  6) 用新密钥验证登录(失败自动修 sshd 公钥登录)
+  7) Komari 注册 + 安装 komari-agent + 可选 agent-guard,之后可选 NodeQuality
+
+options:
+  -V, --version   显示版本号并退出
+  -h, --help      显示本帮助并退出
+
+完成后可 \`ssh <短别名>\` 直连。`;
+
 async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.some((a) => a === '-V' || a === '--version')) {
+    prompts.print(`initnode ${PKG_VERSION}`);
+    return finish(0);
+  }
+  if (argv.some((a) => a === '-h' || a === '--help')) {
+    prompts.print(USAGE);
+    return finish(0);
+  }
+  const unknown = argv.filter((a) => a.startsWith('-'));
+  if (unknown.length > 0) {
+    process.stderr.write(`initnode: unrecognized option '${unknown[0]}'\n${USAGE}\n`);
+    return finish(2);
+  }
   prompts.print(c.bold('initnode —— 新服务器初始化'));
 
   // ---------- [1/7] Komari 配置 ----------
