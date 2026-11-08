@@ -285,7 +285,7 @@ try {
   t('负例:错误密码提示认证失败', /认证失败/.test(err.message));
 }
 
-async function runScenario(label, answers, { interact = null, setup = null } = {}) {
+async function runScenario(label, answers, { interact = null, setup = null, args = [] } = {}) {
   resetMock();
   if (setup) setup();
   console.log(`\n[e2e] 场景: ${label}`);
@@ -295,7 +295,7 @@ async function runScenario(label, answers, { interact = null, setup = null } = {
     komari: { endpoint: `http://127.0.0.1:${KPORT}`, adminApiKey: ADMIN_KEY },
   }), 'utf8');
 
-  const child = spawn(NODE, ['index.js'], {
+  const child = spawn(NODE, ['index.js', ...args], {
     cwd: ROOT,
     env: {
       ...process.env,
@@ -512,6 +512,38 @@ async function runScenario(label, answers, { interact = null, setup = null } = {
   t('S4 公钥认证未被拒(修复在验证前生效)', !mock.authSequence.includes('publickey-rejected'));
   if (!failed) {
     try { fs.rmSync(tmpSsh4, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  }
+}
+
+// ===== 场景 5:命令行直接给连接信息(跳过地址/端口/用户名问询) =====
+{
+  const NAME5 = 'E2E命令行节点';
+  const { code: code5, out: out5, tmpSsh: tmpSsh5 } = await runScenario('命令行指定 root@host -p port', [
+    // 地址/端口/用户名由 argv 提供,这里直接从认证方式开始
+    '1',               // 认证方式:密码
+    PASSWORD,          // SSH 密码
+    'n',               // 关闭自动探测公网 IP
+    'y',               // 信任主机指纹
+    NAME5,             // 节点名称
+    '',                // 标签:跳过
+    'n',               // 跳过 agent-guard
+    'n',               // 跳过 NodeQuality
+  ], { args: ['root@127.0.0.1', '-p', String(sshPort)] });
+
+  t('S5 进程退出码 0', code5 === 0);
+  const plain5 = out5.replace(/\x1b\[[0-9;]*m/g, '');
+  t('S5 输出的连接信息来自命令行', plain5.includes('→ root@127.0.0.1') && plain5.includes(`端口 ${sshPort}`));
+  t('S5 不再问询地址/端口', !out5.includes('服务器地址(') && !/SSH 端口 \[22\]/.test(out5));
+  t('S5 首连用密码认证', mock.authSequence[0] === 'password');
+  t('S5 ssh config 写入命令行给的端口', (() => {
+    try {
+      const cfgText = fs.readFileSync(path.join(tmpSsh5, 'config'), 'utf8');
+      return cfgText.includes('Host 127 127.0.0.1') && cfgText.includes(`Port ${sshPort}`);
+    } catch { return false; }
+  })());
+  t('S5 输出包含初始化完成', out5.includes('初始化完成'));
+  if (!failed) {
+    try { fs.rmSync(tmpSsh5, { recursive: true, force: true }); } catch { /* 忽略 */ }
   }
 }
 

@@ -11,10 +11,25 @@ npm install
 npm link
 
 # 之后任意目录直接运行
-initnode
+initnode           # 交互式:逐项问询
 initnode -V        # 版本号
 initnode -h        # 帮助
+
+# 直接给连接信息(跳过地址/端口/用户名问询,其余步骤照旧)
+initnode root@192.168.1.123 -p 12223
+initnode 192.168.1.123 -l deploy -p 2222 -i ~/.ssh/id_ed25519
 ```
+
+连接信息参数:
+
+| 参数 | 说明 |
+| --- | --- |
+| `[user@]host` | 服务器地址;IPv6 写成 `root@[2001:db8::1]`;用户名缺省 `root` |
+| `-p, --port <port>` | SSH 端口,缺省 22 |
+| `-l, --user <user>` | SSH 用户名;与 `user@host` 同时给出时以 `-l` 为准 |
+| `-i, --identity <path>` | 首连使用的已有私钥(`~` 可代 home),免去认证方式问询;私钥有口令时首次连接失败会自动追问 |
+
+也可以只给一部分(如 `initnode -p 12223`),没给的项照旧交互问询。
 
 不注册也可以 `npm start` / `node index.js` 运行。
 
@@ -28,7 +43,7 @@ initnode
 按提示依次输入:
 
 1. **Komari 面板地址**(默认本家实例)与**管理员 API Key**(WebUI → 个人设置/安全 中创建,格式 `komari-xxxx`;首次输入后存入项目根 `config.json`,已被 .gitignore 排除)
-2. **服务器连接信息**:地址(IPv4/IPv6/域名)、SSH 端口、用户名、首连认证(密码或已有私钥)、是否自动探测公网 IP
+2. **服务器连接信息**:地址(IPv4/IPv6/域名)、SSH 端口、用户名、首连认证(密码或已有私钥)、是否自动探测公网 IP(可用命令行参数预设,见上表)
 3. **信任主机指纹**(TOFU):展示 SHA256 指纹供人工核对
 4. **节点名称**(用于密钥注释与 Komari 节点名)、**标签**(可选,多选)
 
@@ -121,7 +136,7 @@ initnode
 npm test
 ```
 
-- `test/unit.mjs`:纯函数单元测试(命名、别名、config 解析、指纹、报告链接提取、agentguard 脚本、sshd 诊断/修复脚本构造与解析)
+- `test/unit.mjs`:纯函数单元测试(命令行参数解析、命名、别名、config 解析、指纹、报告链接提取、agentguard 脚本、sshd 诊断/修复脚本构造与解析)
 - `test/e2e.mjs`:内置 mock SSH 服务器(ssh2.Server)+ mock Komari 面板,管道喂入答案跑通全流程;含 4 个场景:①探测公网 IP+模板标签 ②关闭探测+自定义标签 ③NodeQuality 交互输入转发 ④**服务器禁用公钥登录→自动启用**(mock 在修复脚本执行前拒绝 publickey 认证)。不触真实 `~/.ssh` 与真实面板
 
 测试重定向用的环境变量:`INITNODE_SSH_DIR`、`INITNODE_CONFIG`、`INITNODE_AGENT_INSTALL_URLS`(逗号分隔的安装脚本源列表)。

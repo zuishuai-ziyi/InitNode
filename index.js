@@ -8,6 +8,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 
 import * as prompts from './src/prompts.js';
+import { parseArgs } from './src/args.js';
 import { loadConfig, saveConfig, ensureKomariConfig } from './src/config.js';
 import {
   connectSSH, execSSH, execSSHStream, installPubKey, normalizeSshError,
@@ -73,9 +74,15 @@ const TOTAL = 7;
 // ---- 命令行元信息(注册为全局命令后使用;行为对齐 ssh 的 -V / -h)----
 const PKG_VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 
-const USAGE = `usage: initnode [-V] [-h]
+const USAGE = `usage: initnode [user@]host [-p port] [-i key] [-l user]
+       initnode                     交互式逐项问询
+       initnode -V | -h
 
-交互式初始化一台新云服务器(不带参数即进入流程):
+初始化一台新云服务器。给出连接信息时跳过对应问询,其余步骤照旧:
+  initnode root@192.168.1.123 -p 12223
+  initnode 192.168.1.123 -l deploy -p 2222 -i ~/.ssh/id_ed25519
+
+流程(共 7 步):
   1) Komari 面板配置与自动发现密钥
   2) 服务器连接信息(地址 / 端口 / 用户 / 密码或已有私钥)
   3) 连接并信任主机指纹(TOFU),可选探测公网 IP
@@ -85,26 +92,35 @@ const USAGE = `usage: initnode [-V] [-h]
   7) Komari 注册 + 安装 komari-agent + 可选 agent-guard,之后可选 NodeQuality
 
 options:
-  -V, --version   显示版本号并退出
-  -h, --help      显示本帮助并退出
+  -p, --port <port>      SSH 端口(默认 22)
+  -l, --user <user>      SSH 用户名(默认 root;与 user@host 同时给出时以 -l 为准)
+  -i, --identity <path>  首次连接用的已有私钥(~ 可代 home;不给则询问认证方式)
+  -V, --version          显示版本号并退出
+  -h, --help             显示本帮助并退出
 
 完成后可 \`ssh <短别名>\` 直连。`;
 
 async function main() {
-  const argv = process.argv.slice(2);
-  if (argv.some((a) => a === '-V' || a === '--version')) {
+  const parsed = parseArgs(process.argv.slice(2));
+  if (parsed.version) {
     prompts.print(`initnode ${PKG_VERSION}`);
     return finish(0);
   }
-  if (argv.some((a) => a === '-h' || a === '--help')) {
+  if (parsed.help) {
     prompts.print(USAGE);
     return finish(0);
   }
-  const unknown = argv.filter((a) => a.startsWith('-'));
-  if (unknown.length > 0) {
-    process.stderr.write(`initnode: unrecognized option '${unknown[0]}'\n${USAGE}\n`);
+  if (parsed.error) {
+    process.stderr.write(`initnode: ${parsed.error}\n${USAGE}\n`);
     return finish(2);
   }
+  // 命令行预设的连接信息;缺失项仍走交互问询
+  const preset = {
+    host: parsed.target?.host ?? null,
+    port: parsed.target?.port ?? parsed.overrides.port ?? null,
+    user: parsed.target?.user ?? parsed.overrides.user ?? null,
+    identityFile: parsed.target?.identityFile ?? parsed.overrides.identityFile ?? null,
+  };
   prompts.print(c.bold('initnode —— 新服务器初始化'));
 
   // ---------- [1/7] Komari 配置 ----------
@@ -129,26 +145,41 @@ async function main() {
 
   // ---------- [2/7] 连接信息 ----------
   step(2, TOTAL, '服务器连接信息');
-  const host = (await prompts.ask('服务器地址(IPv4 / IPv6 / 域名)')).trim();
-  if (!host) return die('服务器地址不能为空');
-  const port = await prompts.askInt('SSH 端口', 22);
-  const user = (await prompts.ask('SSH 用户名', { def: 'root' })).trim();
-  if (!user) return die('SSH 用户名不能为空');
+  let host = preset.host;
+  if (!host) {
+    host = (await prompts.ask('服务器地址(IPv4 / IPv6 / 域名)')).trim();
+    if (!host) return die('服务器地址不能为空');
+  }
+  let port = preset.port;
+  if (port === null) port = await prompts.askInt('SSH 端口', 22);
+  let user = preset.user;
+  if (!user) {
+    user = (await prompts.ask('SSH 用户名', { def: 'root' })).trim();
+    if (!user) return die('SSH 用户名不能为空');
+  }
+  prompts.print(`  ${c.dim('→')} ${c.bold(`${user}@${host}`)}  ${c.dim(`端口 ${port}`)}`);
 
-  const choice = await prompts.choose('首次连接的认证方式', [
-    { label: '密码', value: 'password' },
-    { label: '已有 SSH 私钥', value: 'key' },
-  ]);
   let auth;
   let firstPassphrase = '';
-  if (choice === 'password') {
-    auth = { password: await prompts.askPassword('SSH 密码') };
-  } else {
-    const kp = (await prompts.ask('已有私钥路径(~ 可代 home)', { def: '' })).trim();
-    const keyPath = expandHome(kp);
-    if (!kp || !fs.existsSync(keyPath)) return die(`私钥不存在: ${keyPath}`);
-    firstPassphrase = await prompts.askPassword('私钥口令(无则回车)');
+  if (preset.identityFile) {
+    const keyPath = expandHome(preset.identityFile);
+    if (!fs.existsSync(keyPath)) return die(`私钥不存在: ${keyPath}`);
     auth = { privateKeyPath: keyPath };
+    prompts.print(`  ${c.dim(`使用私钥 ${keyPath}`)}`);
+  } else {
+    const choice = await prompts.choose('首次连接的认证方式', [
+      { label: '密码', value: 'password' },
+      { label: '已有 SSH 私钥', value: 'key' },
+    ]);
+    if (choice === 'password') {
+      auth = { password: await prompts.askPassword('SSH 密码') };
+    } else {
+      const kp = (await prompts.ask('已有私钥路径(~ 可代 home)', { def: '' })).trim();
+      const keyPath = expandHome(kp);
+      if (!kp || !fs.existsSync(keyPath)) return die(`私钥不存在: ${keyPath}`);
+      firstPassphrase = await prompts.askPassword('私钥口令(无则回车)');
+      auth = { privateKeyPath: keyPath };
+    }
   }
   const autoIP = await prompts.confirm('连接后自动探测服务器公网 IP?(用于密钥命名/别名,可选替换连接地址)', true);
 
@@ -162,6 +193,12 @@ async function main() {
       break;
     } catch (err) {
       fail(normalizeSshError(err));
+      // -i 指定的私钥若有口令,首次连接会被拒;此处补问一次而不是让用户重试整个流程
+      if (auth.privateKeyPath && !firstPassphrase
+        && /passphrase|encrypted|decrypt/i.test(String(err.message))) {
+        firstPassphrase = await prompts.askPassword('该私钥有口令,请输入(无则回车)');
+        continue;
+      }
       if (!(await prompts.confirm('重试连接?', true))) return die('已中止');
     }
   }

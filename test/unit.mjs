@@ -17,6 +17,7 @@ const { hostKeyFingerprint } = await import('../src/ssh.js');
 const { extractReportUrl } = await import('../src/nodequality.js');
 const { normalizeTags, parseTagInput, deriveTagTemplates } = await import('../src/tags.js');
 const { isValidIP, isPrivateOrLocalIP, normalizeHost, DETECT_PUBLIC_IP_CMD } = await import('../src/publicip.js');
+const { parseArgs } = await import('../src/args.js');
 const { buildAgentGuardBootstrap, AGENT_GUARD_ASSETS } = await import('../src/agentguard.js');
 const {
   buildInspectScript, parseInspect, buildSshdFixScript, parseFixOutput,
@@ -348,6 +349,46 @@ t('sshd: 脚本均为纯 POSIX sh(不依赖 bash 语法)', () => {
     assert.ok(!/\[\[ /.test(s), '不得使用 [[ ]]');
     assert.ok(!/<<</.test(s), '不得使用 herestring');
   }
+});
+
+// ---- args.js(命令行连接信息)----
+t('args: user@host + -p', () => {
+  const r = parseArgs(['root@192.168.1.123', '-p', '12223']);
+  assert.equal(r.error, null);
+  assert.deepEqual(r.target, {
+    host: '192.168.1.123', user: 'root', port: 12223, identityFile: null,
+  });
+});
+t('args: 只给地址 → 端口 22 / 用户 root', () => {
+  const r = parseArgs(['192.168.1.5']);
+  assert.deepEqual(r.target, { host: '192.168.1.5', user: 'root', port: 22, identityFile: null });
+});
+t('args: -l 覆盖 user@、支持 --port=', () => {
+  const r = parseArgs(['-l', 'deploy', 'root@h.example', '--port=2200']);
+  assert.deepEqual(r.target, { host: 'h.example', user: 'deploy', port: 2200, identityFile: null });
+});
+t('args: IPv6 方括号 + -i 私钥', () => {
+  const r = parseArgs(['admin@[2001:db8::1]', '-i', '~/.ssh/k']);
+  assert.equal(r.target.host, '2001:db8::1');
+  assert.equal(r.target.user, 'admin');
+  assert.equal(r.target.identityFile, '~/.ssh/k');
+});
+t('args: 未给地址 → target 为 null,端口进 overrides', () => {
+  const r = parseArgs(['-p', '12223']);
+  assert.equal(r.target, null);
+  assert.equal(r.overrides.port, 12223);
+});
+t('args: 非法输入均报错', () => {
+  assert.match(parseArgs(['h', '-p', '70000']).error, /invalid port/);
+  assert.match(parseArgs(['h', '-p']).error, /requires an argument/);
+  assert.match(parseArgs(['-Z', 'h']).error, /unrecognized option/);
+  assert.match(parseArgs(['h1', 'h2']).error, /unexpected argument/);
+  assert.match(parseArgs(['-l', '', 'h']).error, /requires an argument/);
+});
+t('args: -V / -h 标记', () => {
+  assert.equal(parseArgs(['-V']).version, true);
+  assert.equal(parseArgs(['--version', 'h']).version, true);
+  assert.equal(parseArgs(['-h']).help, true);
 });
 
 console.log(`\n[unit] ${passed} 项通过${process.exitCode ? '(存在失败)' : ''}`);
