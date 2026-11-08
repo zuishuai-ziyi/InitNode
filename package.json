@@ -1,6 +1,6 @@
 {
   "name": "@zuishuai-ziyi/initnode",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "新云服务器初始化 CLI：生成/上传 SSH 密钥、注册 Komari 监控（自动发现）、清理云厂商监控代理、跑 NodeQuality 质量检测",
   "type": "module",
   "main": "index.js",
