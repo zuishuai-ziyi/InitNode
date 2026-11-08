@@ -171,6 +171,7 @@ git push origin main --follow-tags
 - `files` 只打包 `index.js` 与 `src/`,测试、`config.json`、`tmp/` 不会进包
 - `prepublishOnly` 会先跑完整测试,失败则拒绝发布
 - `--provenance` 需要仓库公开 + `permissions: id-token: write`(已配好),npm 包页面会显示「Built and signed on GitHub Actions」
+- `package-lock.json` 里的 `resolved` 必须是 `https://registry.npmjs.org/...`。本机 registry 指向镜像(如 npmmirror)时重新生成的 lock 会写成镜像地址,CI 上的 npm 12 会以 `EALLOWREMOTE: Fetching packages of type "remote" have been disabled` 直接失败
 - 若用 NPM_TOKEN:写权限令牌最长 90 天,到期需重建并更新 secret;怕忘就用 Trusted Publishing
 
 ## 注意事项
