@@ -2,6 +2,9 @@ name: Publish npm
 
 # 触发：推送 v* tag（与 GitHub Release 同一条 tag）自动发布；
 # 也可在 Actions 页面手动运行，默认只做 dry-run（打包校验），不改动线上包。
+#
+# 认证：优先用 Trusted Publishing(OIDC,免 token)，仓库未配置 NPM_TOKEN 时自动走它；
+# 配了 NPM_TOKEN secret 则退回到令牌方式（npm 现规定写权限令牌最长 90 天，需轮换）。
 on:
   push:
     tags: ['v*']
@@ -18,20 +21,28 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write # npm provenance：由 OIDC 签名，npm 页面显示「Built and signed on GitHub Actions」
+  id-token: write # Trusted Publishing(OIDC) 与 npm provenance 都需要
 
 jobs:
   publish:
     name: test & publish
     runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           cache: npm
+
+      # setup-node 自带的 npm 是 10.x，而 OIDC Trusted Publishing 要求 npm >= 11.5.1
+      - name: 升级 npm
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       - name: 安装依赖
         run: npm ci
@@ -53,13 +64,37 @@ jobs:
       - name: 打包内容预览
         run: npm pack --dry-run
 
-      - name: 发布
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # 本地已发过的版本，tag 再触发时不重复发布（npm 不允许覆盖同版本）
+      - name: 检查版本是否已发布
+        id: exists
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            npm publish --provenance --access public
-          elif [ "${{ inputs.dry-run }}" = "true" ]; then
+          pkg="$(node -p "require('./package.json').name")"
+          ver="$(node -p "require('./package.json').version")"
+          if npm view "$pkg@$ver" version >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$pkg@$ver 已在 registry 上，跳过发布（只保留测试与打包校验）"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 没配 NPM_TOKEN 时 setup-node 仍会写一行空的 _authToken，删掉才走 OIDC
+      - name: 清理空的 authToken
+        if: env.NODE_AUTH_TOKEN == ''
+        run: |
+          if [ -n "$NPM_CONFIG_USERCONFIG" ] && [ -f "$NPM_CONFIG_USERCONFIG" ]; then
+            sed -i '/_authToken/d' "$NPM_CONFIG_USERCONFIG"
+            echo "已移除空 authToken，改用 OIDC Trusted Publishing"
+          fi
+
+      - name: 发布
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          if [ -n "$NODE_AUTH_TOKEN" ]; then
+            echo "认证方式：NPM_TOKEN 秘密（注意 90 天过期需轮换）"
+          else
+            echo "认证方式：OIDC Trusted Publishing（免 token）"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry-run }}" = "true" ]; then
             echo "手动触发且勾选 dry-run：只做打包校验"
             npm publish --dry-run --access public
           else

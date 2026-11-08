@@ -130,11 +130,27 @@ npm test
 
 包名 `@zuishuai-ziyi/initnode`,命令仍是 `initnode`(npm 上的 `initnode` 已被他人占用,v1.0.1,故用 scope)。本机 registry 是 npmmirror,发布路径由 `publishConfig.registry` 固定为 `registry.npmjs.org`,不受镜像配置影响。
 
-**首次准备(一次性)**
+**认证方式:npm 现在只有两条路**
 
-1. npm 账号需拥有 `zuishuai-ziyi` 这个 scope(`npm login` 后 `npm whoami` 确认用户名一致)
-2. npmjs.com → Access Tokens → Granular Access Token(Read and write,可选择该 scope 或所有包)
-3. GitHub 仓库 Settings → Secrets and variables → Actions → New repository secret,名字 `NPM_TOKEN`,值为上面的 token
+| 方式 | 说明 |
+|------|------|
+| Trusted Publishing(OIDC) | CI 用,无需任何密钥、不会过期;要求 npm CLI >= 11.5.1、仓库公开、包**已存在** |
+| Granular Access Token | 写权限令牌默认 **7 天**过期、**最长 90 天**,到期必须重建;适合首次发布或临时手动发布 |
+
+因为配 Trusted Publisher 要求包已存在,首发必须先用令牌或验证码:
+
+```powershell
+npm login                                   # 已登录可跳过
+npm publish --access public --otp=123456     # 或建一个 7 天 granular token 后直接 publish
+```
+
+**配置 Trusted Publisher(首发之后,一次性)**
+
+```powershell
+# npm >= 11.15,会要求 2FA
+npm trust github @zuishuai-ziyi/initnode --file publish.yml --repo zuishuai-ziyi/InitNode --allow-publish --yes
+# 或网页: https://www.npmjs.com/package/@zuishuai-ziyi/initnode/access → Trusted Publisher
+```
 
 **自动发布(CI)**
 
@@ -143,18 +159,19 @@ npm version patch            # 或 minor / major:改 package.json + lock 并打 
 git push origin main --follow-tags
 ```
 
-推 `v*` tag 触发 `.github/workflows/publish.yml`:安装依赖 → `npm test` → 校验 tag 与 `package.json` 版本一致 → `npm pack --dry-run` 预览 → `npm publish --provenance --access public`。
+推 `v*` tag 触发 `.github/workflows/publish.yml`:升级 npm → `npm ci` → `npm test` → 校验 tag 与 `package.json` 版本一致 → `npm pack --dry-run` 预览 → `npm publish --provenance --access public`。**没配 `NPM_TOKEN` secret 时自动走 OIDC**;配了则退回令牌方式。
 
 **手动发布**
 
 - Actions → `Publish npm` → Run workflow:默认 `dry-run=true`,只跑测试与打包校验;取消勾选才真正发布
-- 本地校验:`npm run publish:dry`(只打包,不写 registry);确认无误后 `npm login && npm publish --access public`
+- 本地:`npm run publish:dry` 只打包;`npm publish --otp=<code>` 真发布
 
 **注意事项**
 
 - `files` 只打包 `index.js` 与 `src/`,测试、`config.json`、`tmp/` 不会进包
 - `prepublishOnly` 会先跑完整测试,失败则拒绝发布
-- `--provenance` 需要仓库公开 + `permissions: id-token: write`(已在 workflow 配好),npm 包页面会显示「Built and signed on GitHub Actions」
+- `--provenance` 需要仓库公开 + `permissions: id-token: write`(已配好),npm 包页面会显示「Built and signed on GitHub Actions」
+- 若用 NPM_TOKEN:写权限令牌最长 90 天,到期需重建并更新 secret;怕忘就用 Trusted Publishing
 
 ## 注意事项
 
