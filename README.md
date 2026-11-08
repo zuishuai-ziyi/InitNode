@@ -63,20 +63,28 @@ npm start          # 或 node index.js
 
 ## 厂商监控清理服务(agent-guard,可选)
 
-初始化第 7 步末尾询问是否安装(默认是)。用于自动检测并清除云厂商 guest 监控代理:`qemu-guest-agent`、`open-vm-tools`(vmtoolsd/vgauth)、`lxd-agent`(含 lxd snap、lxd-agent-loader);刻意不碰 komari-agent 与 cloud-init。
+初始化第 7 步末尾询问是否安装(默认是)。用于自动检测并清除云厂商 guest/管理/监控代理,覆盖 14 家:KVM(`qemu-guest-agent`)、VMware(`open-vm-tools`,含 vmtoolsd/vgauthd)、LXD(`lxd-agent`、lxd snap、`lxd-agent-loader`)、Azure(WALinuxAgent/waagent)、AWS(`amazon-ssm-agent`、`amazon-cloudwatch-agent`)、GCP(`google-guest-agent`、`google-osconfig-agent`)、阿里云(安骑士 aegis/AliYunDun、`aliyun-service` 云助手、cloudmonitor)、腾讯云(`barad_agent`、`tat_agent`、云镜 YDService/YDLive)、华为云(`hostguard`)、京东云(`jdog`)、Oracle(`oracle-cloud-agent`)、DigitalOcean(`do-agent`)、Xen(`xe-daemon`)、Hyper-V(`hv_kvp_daemon`/`hv_vss_daemon`);刻意不碰 komari-agent、cloud-init、宝塔、docker/containerd、nginx/php-fpm/mysqld、gost、sshd,也不碰第三方监控(netdata/zabbix/telegraf/node_exporter/datadog)。
 
 安装内容(全部 systemd 原生机制,不依赖 cron):
 
 | 组件 | 作用 |
 |------|------|
-| `/usr/local/bin/agent-guard.sh` | 清理脚本:自动 purge 重新出现的代理包、杀进程、清开机自启、保持 lxd-agent 永久 mask |
+| `/usr/local/bin/agent-guard.sh` | 清理脚本:purge 重新出现的代理包、按 comm 名与命令行双路杀进程(能识别 python/perl 型代理)、厂商 unit 一律 stop+disable+mask、清 SysV 自启链与 cron/rc.local 钩子、删残留目录、保持 lxd-agent 永久 mask;已 mask 的 unit 不重复动作 |
 | `agent-guard.service` | 开机(oneshot)立即清一遍 |
-| `agent-guard.timer` | 每分钟触发一次清理(兑底) |
-| `agent-guard-monitor.py` + `.service` | netlink proc-connector 监听器:厂商代理进程被创建的同一秒即触发清理(监听 vmtoolsd/vgauthd/qemu-ga) |
+| `agent-guard.timer` | 每分钟触发一次清理(兜底) |
+| `agent-guard-monitor.py` + `.service` | netlink proc-connector 监听器:厂商代理进程被创建的同一秒即触发清理(26 个 comm 名 + 31 条 cmdline 片段,能识别 python 型代理) |
 
 依赖处理:无 systemd 则放弃安装;缺 `flock`(util-linux)自动去掉并发锁行;缺 `python3` 时按 apt/dnf/yum/apk 顺序尝试安装,仍失败则跳过秒级监听(开机清理 + 每分钟 timer 不受影响)。
 
 日志与卸载:动作日志 `/var/log/agent-guard.log`,心跳 `/run/agent-guard.lastrun`;卸载:`systemctl disable --now agent-guard.timer agent-guard.service agent-guard-monitor.service && rm -f /usr/local/bin/agent-guard.sh /usr/local/bin/agent-guard-monitor.py /etc/systemd/system/agent-guard*.service /etc/systemd/system/agent-guard.timer`。
+
+## 一次性清理(agent-guard 之外)
+
+`src/vendorclean/vendor-clean.sh` 是一次性「大扫除」,覆盖 KVM/VMware/LXD/Azure/AWS/GCP/阿里云(安骑士 aegis)/腾讯云(barad/TAT/云镜)/华为云/京东云/Oracle/DO/Xen/Hyper-V 等厂商代理:卸包(apt/dnf/yum/apk)、杀进程、stop+disable+mask unit、清 SysV 自启链与 cron/rc.local 钩子、删残留目录、清 snap lxd,最后复查并给出「命中/已处理/失败」统计。
+
+- `sh vendor-clean.sh --dry-run` 只出清单不改系统;去掉 `--dry-run` 才真删(需 root,日志 `/var/log/vendor-clean.log`)
+- `--third-party` 额外清 netdata / zabbix-agent / telegraf / node_exporter / datadog
+- 刻意不动 cloud-init、komari-agent、宝塔、docker。详见 `src/vendorclean/README.md`
 
 ## 本地产物(与既有惯例一致)
 

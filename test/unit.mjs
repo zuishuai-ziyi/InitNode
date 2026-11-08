@@ -191,6 +191,9 @@ t('agentguard: 依赖处理(systemd 必须/flock 缺失去锁/python3 尝试安�
   assert.ok(s.includes('apt-get install -y python3'), 'apt 安装 python3');
   assert.ok(s.includes('dnf install -y -q python3'), 'dnf 安装 python3');
   assert.ok(s.includes('apk add --no-cache python3'), 'apk 安装 python3');
+  // 重装/升级必须显式重启已在运行的单元(enable --now 对 active 单元是空操作)
+  assert.ok(s.includes('systemctl restart agent-guard-monitor.service'), 'monitor 显式重启');
+  assert.ok(s.includes('systemctl restart agent-guard.timer'), 'timer 显式重启');
   assert.ok(s.includes('INITNODE_AG_RESULT systemd='), '结果标记');
 });
 t('agentguard: 内嵌资产关键内容(guard 范围/monitor 偏移修复回归)', () => {
@@ -200,11 +203,36 @@ t('agentguard: 内嵌资产关键内容(guard 范围/monitor 偏移修复回归)
   assert.ok(guard.includes('lxd-agent-loader'), 'guard 覆盖 lxd');
   assert.ok(guard.includes('NOT touched: komari-agent, cloud-init'), '不碰 komari/cloud-init');
   assert.ok(guard.includes('flock -n 9'), '并发锁');
+  assert.ok(guard.includes("<<'VENDOR_PAT_EOF'"), 'guard 自带 heredoc 也加引号');
+  // 厂商范围扩到 14 家(与 src/vendorclean/vendor-clean.sh 同步)
+  [
+    'walinuxagent', 'amazon-ssm-agent', 'amazon-cloudwatch-agent',
+    'google-guest-agent', 'google-osconfig-agent',
+    'aliyun-service', 'AliYunDun', 'cloudmonitor',
+    'barad_agent', 'tat_agent', 'YDService',
+    'hostguard', 'jdog', 'oracle-cloud-agent', 'do-agent',
+    'xe-daemon', 'hv_kvp_daemon',
+  ].forEach((v) => assert.ok(guard.includes(v), 'guard 覆盖 ' + v));
+  // 明示的保护名单(不碰的东西必须写在脚本注释里,防止后人误扩)
+  ['komari-agent', 'cloud-init', 'BT-Panel', 'docker/containerd', 'netdata'].forEach(
+    (v) => assert.ok(guard.includes(v), 'guard 明示不动 ' + v)
+  );
+  // 幂等:已 mask 的 unit 跳过,避免每分钟重复 systemctl 动作
+  assert.ok(guard.includes('[ "$(systemctl is-enabled "$u" 2>/dev/null)" = masked ]'), '已 mask 跳过');
+  assert.ok(guard.includes('unit_present()'), 'unit 存在性检查');
   // netlink cn_proc 解析偏移回归(曾因 cn_msg 头 16/20 字节算错导致全部事件被丢)
   assert.equal(/CN_MSG_HDRLEN = (\d+)/.exec(monitor)[1], '20');
   assert.equal(/PROC_WHAT_OFF = (\d+)/.exec(monitor)[1], '0');
   assert.equal(/PROC_DATA_OFF = (\d+)/.exec(monitor)[1], '16');
+  assert.equal(/PROC_COMM_OFF = (\d+)/.exec(monitor)[1], '24');
+  assert.ok(monitor.includes('PROC_EVENT_COMM'), '监听 comm 事件(PID namespace 内也可命中)');
+  assert.ok(monitor.includes('def match_comm'), 'comm 15 字节截断兼容');
   assert.ok(monitor.includes('PROC_EVENT_EXEC'), '监听 exec 事件');
+  // python/perl 型代理靠 cmdline 片段识别
+  assert.ok(monitor.includes('CMD_TOKENS'), 'monitor 支持命令行匹配');
+  assert.ok(monitor.includes('def is_vendor_agent'), 'monitor 判定函数');
+  assert.ok(/"hostguard"/.test(monitor) && /"AliYunDun"/.test(monitor), 'monitor 覆盖腾讯/阿里');
+  assert.ok(monitor.includes('"hv_vss_daemon"'), 'monitor 覆盖 Hyper-V');
   assert.ok(oneshotUnit.includes('ExecStart=/usr/local/bin/agent-guard.sh'));
   assert.ok(timerUnit.includes('OnCalendar='), 'timer 每分钟');
   assert.ok(monitorUnit.includes('agent-guard-monitor.py'));

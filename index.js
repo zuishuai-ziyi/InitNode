@@ -338,7 +338,7 @@ async function main() {
   // ---------- 厂商监控清理服务(可选,失败不阻塞) ----------
   prompts.print('');
   if (await prompts.confirm('安装厂商监控清理服务 agent-guard?(自动清除 qemu-guest-agent/open-vm-tools/lxd 等厂商代理,不碰 komari)', true)) {
-    prompts.print('  写入清理脚本与 systemd 单元(开机清理 + 秒级进程触发 + 每分钟兑底)...');
+    prompts.print('  写入清理脚本与 systemd 单元(开机清理 + 秒级进程触发 + 每分钟兜底)...');
     try {
       const r = await installAgentGuard(mainConn);
       if (!r.systemd) {

@@ -1,6 +1,8 @@
-// agent-guard 清理服务安装:自动检测并清除云厂商 guest 监控代理
-// (qemu-guest-agent / open-vm-tools 含 vmtoolsd+vgauth / lxd-agent 含 lxd snap /
-//  lxd-agent-loader)。刻意不碰 komari-agent 与 cloud-init。
+// agent-guard 清理服务安装:自动检测并清除云厂商 guest/管理/监控代理
+// (14 家:KVM qemu-ga / VMware vmtoolsd+vgauthd / LXD lxd-agent+lxd snap /
+//  Azure waagent / AWS ssm+cloudwatch / GCP google-guest+osconfig / 阿里云 aegis+云助手+cloudmonitor /
+//  腾讯云 barad_agent+TAT+云镜 / 华为 hostguard / 京东 jdog / Oracle / DigitalOcean / Xen / Hyper-V)。
+// 刻意不碰 komari-agent / cloud-init / 宝塔 / docker / 第三方监控。
 //
 // 组件(均为 systemd 原生机制,不依赖 cron):
 //   - agent-guard.sh        清理脚本(开机清一遍 + 每分钟 timer 兜底)
@@ -27,12 +29,8 @@ export const AGENT_GUARD_ASSETS = {
   monitor: readAsset('agent-guard-monitor.py'),
   oneshotUnit: readAsset('agent-guard.service'),
   timerUnit: readAsset('agent-guard.timer'),
-  monitorUnit: readAgentGuardMonitorUnit(),
+  monitorUnit: readAsset('agent-guard-monitor.service'),
 };
-
-function readAgentGuardMonitorUnit() {
-  return readAsset('agent-guard-monitor.service');
-}
 
 // heredoc 片段:定界符必须加引号,防止远端 shell 展开脚本内容(如 ${Status})
 function heredoc(dest, marker, content) {
@@ -92,8 +90,12 @@ fi
 systemctl daemon-reload
 systemctl enable --now agent-guard.service >/dev/null 2>&1 || ag_note "agent-guard.service 启用失败"
 systemctl enable --now agent-guard.timer >/dev/null 2>&1 || ag_note "agent-guard.timer 启用失败"
+# enable --now 对已在运行的单元是空操作:重装/升级时必须显式重启,
+# 否则旧的 timer 与 monitor 进程会继续跑旧代码(monitor 是常驻 python 进程)
+systemctl restart agent-guard.timer >/dev/null 2>&1 || ag_note "agent-guard.timer 重启失败"
 if [ "$AG_MONITOR" = yes ]; then
   systemctl enable --now agent-guard-monitor.service >/dev/null 2>&1 || ag_note "agent-guard-monitor.service 启用失败"
+  systemctl restart agent-guard-monitor.service >/dev/null 2>&1 || ag_note "agent-guard-monitor.service 重启失败"
 fi
 
 # 装完立即清一轮
